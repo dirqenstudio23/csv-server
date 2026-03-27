@@ -3,6 +3,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 app.use(express.json({ limit: "10mb" }));
+app.use(express.text({ limit: "10mb" }));
 
 // In-memory storage — file tersimpan selama server hidup
 const fileStore = {};
@@ -11,15 +12,47 @@ const fileStore = {};
 const SECRET_KEY = process.env.SECRET_KEY || "ghl-csv-secret-2024";
 
 // =============================================
+// POST /debug — Lihat apa yang GHL kirim
+// =============================================
+app.post("/debug", (req, res) => {
+  console.log("=== DEBUG REQUEST ===");
+  console.log("Headers:", JSON.stringify(req.headers));
+  console.log("Body type:", typeof req.body);
+  console.log("Body keys:", Object.keys(req.body || {}));
+  console.log("Body raw:", JSON.stringify(req.body).substring(0, 500));
+  console.log("====================");
+
+  return res.json({
+    success:      true,
+    bodyType:     typeof req.body,
+    bodyKeys:     Object.keys(req.body || {}),
+    bodyPreview:  JSON.stringify(req.body).substring(0, 500),
+    secretReceived: req.body ? req.body.secretKey || "NOT FOUND" : "NO BODY"
+  });
+});
+
+// =============================================
 // POST /upload — Terima CSV dari GHL
 // =============================================
 app.post("/upload", (req, res) => {
   try {
-    const { secretKey, csvContent, fileName, reportMonth, totalContacts } = req.body;
+    // Handle body yang mungkin double-stringified oleh GHL
+    let parsedBody = req.body;
+    if (typeof parsedBody === "string") {
+      try { parsedBody = JSON.parse(parsedBody); } catch(e) {}
+    }
 
-    // Validasi secret key
+    const { csvContent, fileName, reportMonth, totalContacts } = parsedBody;
+
+    // Validasi secret key — cek dari query param ATAU body
+    const secretKey = req.query.key || parsedBody.secretKey;
     if (secretKey !== SECRET_KEY) {
-      return res.status(401).json({ success: false, error: "Unauthorized" });
+      return res.status(401).json({ 
+        success: false, 
+        error: "Unauthorized",
+        receivedKey: secretKey ? secretKey.substring(0, 5) + "..." : "undefined",
+        expectedKey: SECRET_KEY.substring(0, 5) + "..."
+      });
     }
 
     if (!csvContent || !fileName) {
