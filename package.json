@@ -1,0 +1,12 @@
+{
+  "name": "ghl-csv-server",
+  "version": "1.0.0",
+  "description": "Simple CSV hosting server for GHL leads export",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
