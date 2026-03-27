@@ -3,135 +3,93 @@ const crypto  = require("crypto");
 const app     = express();
 
 app.use(express.json({ limit: "10mb" }));
-app.use(express.text({ limit: "10mb" }));
+app.use(express.text({ limit: "10mb", type: "*/*" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// In-memory storage — file tersimpan selama server hidup
-const fileStore = {};
-
-// Secret key untuk keamanan — ganti dengan string random Anda
+const fileStore  = {};
+const chunkStore = {};
 const SECRET_KEY = process.env.SECRET_KEY || "ghl-csv-secret-2024";
 
-// =============================================
-// POST /debug — Lihat apa yang GHL kirim
-// =============================================
-app.post("/debug", (req, res) => {
-  console.log("=== DEBUG REQUEST ===");
-  console.log("Headers:", JSON.stringify(req.headers));
-  console.log("Body type:", typeof req.body);
-  console.log("Body keys:", Object.keys(req.body || {}));
-  console.log("Body raw:", JSON.stringify(req.body).substring(0, 500));
-  console.log("====================");
+function validateKey(req) {
+  return req.query.key === SECRET_KEY;
+}
 
-  return res.json({
-    success:      true,
-    bodyType:     typeof req.body,
-    bodyKeys:     Object.keys(req.body || {}),
-    bodyPreview:  JSON.stringify(req.body).substring(0, 500),
-    secretReceived: req.body ? req.body.secretKey || "NOT FOUND" : "NO BODY"
-  });
+// POST /chunk/start
+app.post("/chunk/start", (req, res) => {
+  if (!validateKey(req)) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+  const fileName      = req.query.fileName      || "leads.csv";
+  const reportMonth   = req.query.reportMonth   || "";
+  const totalContacts = req.query.totalContacts || 0;
+  const uploadId      = crypto.randomBytes(16).toString("hex");
+
+  chunkStore[uploadId] = {
+    chunks: [], fileName: decodeURIComponent(fileName),
+    reportMonth: decodeURIComponent(reportMonth),
+    totalContacts, createdAt: new Date()
+  };
+
+  return res.json({ success: true, uploadId, message: "Upload started" });
 });
 
-// =============================================
-// POST /upload — Terima CSV dari GHL
-// =============================================
-app.post("/upload", (req, res) => {
+// POST /chunk/append
+app.post("/chunk/append", (req, res) => {
+  if (!validateKey(req)) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+  const uploadId  = req.query.uploadId;
+  const chunkData = req.query.chunk;
+
+  if (!uploadId || !chunkStore[uploadId]) return res.status(400).json({ success: false, error: "Invalid uploadId" });
+  if (!chunkData) return res.status(400).json({ success: false, error: "chunk required" });
+
   try {
-    // Handle body yang mungkin double-stringified oleh GHL
-    let parsedBody = req.body;
-    if (typeof parsedBody === "string") {
-      try { parsedBody = JSON.parse(parsedBody); } catch(e) {}
-    }
-
-    const { csvContent, fileName, reportMonth, totalContacts } = parsedBody;
-
-    // Validasi secret key — cek dari query param ATAU body
-    const secretKey = req.query.key || parsedBody.secretKey;
-    if (secretKey !== SECRET_KEY) {
-      return res.status(401).json({ 
-        success: false, 
-        error: "Unauthorized",
-        receivedKey: secretKey ? secretKey.substring(0, 5) + "..." : "undefined",
-        expectedKey: SECRET_KEY.substring(0, 5) + "..."
-      });
-    }
-
-    if (!csvContent || !fileName) {
-      return res.status(400).json({ success: false, error: "csvContent and fileName required" });
-    }
-
-    // Generate unique ID untuk file
-    const fileId      = crypto.randomBytes(16).toString("hex");
-    const createdAt   = new Date();
-    const expiresAt   = new Date(createdAt.getTime() + 14 * 24 * 60 * 60 * 1000); // 14 hari
-
-    // Simpan di memory
-    fileStore[fileId] = {
-      csvContent,
-      fileName,
-      reportMonth,
-      totalContacts,
-      createdAt,
-      expiresAt
-    };
-
-    // Cleanup file yang sudah expired
-    const now = new Date();
-    Object.keys(fileStore).forEach(id => {
-      if (fileStore[id].expiresAt < now) {
-        delete fileStore[id];
-      }
-    });
-
-    const downloadUrl = `${process.env.BASE_URL || "http://localhost:3000"}/download/${fileId}`;
-
-    return res.json({
-      success:     true,
-      fileId:      fileId,
-      downloadUrl: downloadUrl,
-      fileName:    fileName,
-      expiresAt:   expiresAt.toISOString()
-    });
-
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
+    chunkStore[uploadId].chunks.push(decodeURIComponent(chunkData));
+    return res.json({ success: true, uploadId, chunksTotal: chunkStore[uploadId].chunks.length });
+  } catch(e) {
+    return res.status(400).json({ success: false, error: e.message });
   }
 });
 
-// =============================================
-// GET /download/:fileId — Download CSV
-// =============================================
+// POST /chunk/finalize
+app.post("/chunk/finalize", (req, res) => {
+  if (!validateKey(req)) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+  const uploadId = req.query.uploadId;
+  if (!uploadId || !chunkStore[uploadId]) return res.status(400).json({ success: false, error: "Invalid uploadId" });
+
+  const upload     = chunkStore[uploadId];
+  const csvContent = upload.chunks.join("");
+  const fileId     = crypto.randomBytes(16).toString("hex");
+  const expiresAt  = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
+
+  fileStore[fileId] = {
+    csvContent, fileName: upload.fileName, reportMonth: upload.reportMonth,
+    totalContacts: upload.totalContacts, createdAt: new Date(), expiresAt
+  };
+
+  delete chunkStore[uploadId];
+
+  const now = new Date();
+  Object.keys(fileStore).forEach(id => { if (fileStore[id].expiresAt < now) delete fileStore[id]; });
+
+  const downloadUrl = `${process.env.BASE_URL || "http://localhost:3000"}/download/${fileId}`;
+  return res.json({ success: true, fileId, downloadUrl, fileName: upload.fileName, csvSize: csvContent.length, expiresAt: expiresAt.toISOString() });
+});
+
+// GET /download/:fileId
 app.get("/download/:fileId", (req, res) => {
-  const { fileId } = req.params;
-  const file = fileStore[fileId];
-
-  if (!file) {
-    return res.status(404).send("File not found or expired.");
-  }
-
-  // Cek expired
-  if (new Date() > file.expiresAt) {
-    delete fileStore[fileId];
-    return res.status(410).send("File has expired.");
-  }
-
-  // Kirim file sebagai download
+  const file = fileStore[req.params.fileId];
+  if (!file) return res.status(404).send("File not found or expired.");
+  if (new Date() > file.expiresAt) { delete fileStore[req.params.fileId]; return res.status(410).send("Expired."); }
   res.setHeader("Content-Type", "text/csv");
   res.setHeader("Content-Disposition", `attachment; filename="${file.fileName}"`);
   return res.send(file.csvContent);
 });
 
-// =============================================
-// GET /health — Health check
-// =============================================
+// GET /health
 app.get("/health", (req, res) => {
-  res.json({
-    status:     "ok",
-    filesStored: Object.keys(fileStore).length,
-    uptime:     process.uptime()
-  });
+  res.json({ status: "ok", filesStored: Object.keys(fileStore).length, chunksActive: Object.keys(chunkStore).length, uptime: process.uptime() });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`CSV Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`CSV Chunk Server running on port ${PORT}`));
